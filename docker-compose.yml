@@ -1,76 +1,128 @@
 version: "3.9"
 
 services:
-  postgres:
-    image: timescale/timescaledb:latest-pg15
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-fdi}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fdi_secret}
-      POSTGRES_DB: ${POSTGRES_DB:-fdi}
-    ports:
-      - "5432:5432"
-    volumes:
-      - pg_data:/var/lib/postgresql/data
-      - ./infra/docker/init_db.sql:/docker-entrypoint-initdb.d/init.sql
-
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    ports:
-      - "6379:6379"
-
   api:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    env_file: .env
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: fdi_api
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - .:/app
     ports:
       - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/football_di
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - ODDS_API_KEY=${ODDS_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY}
+      - MODEL_DIR=/app/backend/ml/artifacts
     depends_on:
-      - postgres
-      - redis
-    volumes:
-      - ./backend:/app
-      - ./ml:/ml
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - fdi_net
 
   worker:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    command: celery -A workers.celery_app worker --loglevel=info -Q odds,features,simulation
-    env_file: .env
-    depends_on:
-      - postgres
-      - redis
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: fdi_worker
+    command: celery -A backend.workers.celery_app worker --loglevel=info --concurrency=4
     volumes:
-      - ./backend:/app
-      - ./ml:/ml
+      - .:/app
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/football_di
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - ODDS_API_KEY=${ODDS_API_KEY}
+      - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY}
+      - MODEL_DIR=/app/backend/ml/artifacts
+    depends_on:
+      - db
+      - redis
+    networks:
+      - fdi_net
 
   beat:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    command: celery -A workers.celery_app beat --loglevel=info
-    env_file: .env
-    depends_on:
-      - postgres
-      - redis
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: fdi_beat
+    command: celery -A backend.workers.celery_app beat --loglevel=info
     volumes:
-      - ./backend:/app
+      - .:/app
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/football_di
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    depends_on:
+      - redis
+    networks:
+      - fdi_net
+
+  db:
+    image: timescale/timescaledb:latest-pg15
+    container_name: fdi_db
+    environment:
+      POSTGRES_DB: football_di
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fdi_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: fdi_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - fdi_net
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    restart: unless-stopped
+    container_name: fdi_frontend
     ports:
       - "3000:3000"
     environment:
       - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - api
+    networks:
+      - fdi_net
+
+  flower:
+    image: mher/flower:2.0
+    container_name: fdi_flower
+    command: celery flower --broker=redis://redis:6379/1 --port=5555
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+    networks:
+      - fdi_net
 
 volumes:
-  pg_data:
+  pgdata:
+
+networks:
+  fdi_net:
+    driver: bridge
