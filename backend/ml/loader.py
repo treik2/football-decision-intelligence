@@ -1,27 +1,23 @@
-"""Model artifact loader — loads from disk or MLFlow model registry."""
-from __future__ import annotations
 import os
+import joblib
 import logging
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+MODEL_DIR = Path(os.getenv("MODEL_DIR", "backend/ml/artifacts"))
 
-def load_artifact(path: str):
-    import joblib
-    if not os.path.exists(path):
-        logger.warning("Model artifact not found at %s — using fallback.", path)
+
+def load_model(name: str):
+    path = MODEL_DIR / f"{name}.pkl"
+    if not path.exists():
+        logger.warning(f"Model artifact {path} not found, using fallback estimator")
         return None
-    logger.info("Loading model from %s", path)
     return joblib.load(path)
 
 
-def load_from_mlflow(model_name: str, stage: str = "Production"):
-    """Load model from MLFlow registry. Requires MLFLOW_TRACKING_URI env."""
-    try:
-        import mlflow.pyfunc
-        uri = f"models:/{model_name}/{stage}"
-        logger.info("Loading MLFlow model: %s", uri)
-        return mlflow.pyfunc.load_model(uri)
-    except Exception as e:
-        logger.error("MLFlow load failed: %s", e)
-        return None
+def save_model(model, name: str):
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    path = MODEL_DIR / f"{name}.pkl"
+    joblib.dump(model, path)
+    logger.info(f"Model saved to {path}")

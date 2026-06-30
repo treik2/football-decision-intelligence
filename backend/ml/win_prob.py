@@ -1,44 +1,64 @@
-"""Win probability model wrapper.
-In production: load a trained LightGBM / CatBoost model via joblib.
-Fallback: Elo + xG logistic estimate so the API is always runnable.
-"""
-from __future__ import annotations
-import os
 import numpy as np
 from typing import Dict
+from backend.ml.loader import load_model
+import logging
 
-try:
-    import joblib
-    _MODEL_PATH = os.getenv("WIN_MODEL_PATH", "ml/artifacts/win_prob_lgbm.pkl")
-    _model = joblib.load(_MODEL_PATH) if os.path.exists(_MODEL_PATH) else None
-except Exception:
-    _model = None
-
-
-FEATURE_ORDER = [
-    "elo_diff", "xg_diff", "home_xg", "away_xg",
-    "home_form", "away_form", "home_rest_days", "away_rest_days",
-    "home_injuries", "away_injuries", "is_neutral",
-    "temp_c", "wind_mps", "rain_mm",
-]
-
-
-def _fallback_predict(features: Dict) -> Dict[str, float]:
-    """Simple logistic estimate using Elo + xG when model file is absent."""
-    elo_diff = features.get("elo_diff", 0.0)
-    xg_diff = features.get("xg_diff", 0.0)
-    raw = 0.45 + 0.0018 * elo_diff + 0.04 * np.tanh(xg_diff)
-    home_p = float(np.clip(raw, 0.05, 0.90))
-    draw_p = float(np.clip(0.26 - 0.10 * abs(np.tanh(xg_diff)), 0.08, 0.35))
-    away_p = max(0.05, 1.0 - home_p - draw_p)
-    total = home_p + draw_p + away_p
-    return {"home": home_p / total, "draw": draw_p / total, "away": away_p / total}
+logger = logging.getLogger(__name__)
 
 
 class WinProbModel:
+    """
+    Wrapper around a trained LightGBM/XGBoost classifier.
+    Falls back to an Elo+xG heuristic when no trained artifact exists.
+    """
+
+    version = "1.0.0"
+
+    def __init__(self):
+        self._model = load_model("win_prob")
+        if self._model is None:
+            logger.warning("Win prob model not found — using heuristic fallback")
+
+    def _feature_vector(self, features: Dict) -> np.ndarray:
+        return np.array([
+            features.get("elo_diff", 0.0),
+            features.get("xg_diff", 0.0),
+            features.get("home_xg", 1.3),
+            features.get("away_xg", 1.0),
+            features.get("home_form", 0.5),
+            features.get("away_form", 0.5),
+            features.get("home_rest_days", 7),
+            features.get("away_rest_days", 7),
+            features.get("home_injury_score", 0.0),
+            features.get("away_injury_score", 0.0),
+            features.get("temperature", 15.0),
+            features.get("rain_mm", 0.0),
+            features.get("home_motivation", 0.5),
+            features.get("away_motivation", 0.5),
+        ]).reshape(1, -1)
+
+    def _heuristic(self, features: Dict) -> Dict[str, float]:
+        elo_diff = features.get("elo_diff", 0.0)
+        xg_diff = features.get("xg_diff", 0.0)
+        home_p = 0.45 + 0.002 * elo_diff + 0.03 * np.tanh(xg_diff)
+        home_p = float(np.clip(home_p, 0.05, 0.90))
+        draw_p = float(np.clip(0.25 * (1.0 - abs(np.tanh(xg_diff))), 0.08, 0.35))
+        away_p = float(np.clip(1.0 - home_p - draw_p, 0.05, 0.90))
+        total = home_p + draw_p + away_p
+        return {
+            "home": round(home_p / total, 4),
+            "draw": round(draw_p / total, 4),
+            "away": round(away_p / total, 4),
+        }
+
     def predict(self, features: Dict) -> Dict[str, float]:
-        if _model is not None:
-            row = np.array([[features.get(f, 0.0) for f in FEATURE_ORDER]])
-            proba = _model.predict_proba(row)[0]  # shape (3,) [away, draw, home]
-            return {"home": float(proba[2]), "draw": float(proba[1]), "away": float(proba[0])}
-        return _fallback_predict(features)
+        if self._model is None:
+            return self._heuristic(features)
+        X = self._feature_vector(features)
+        proba = self._model.predict_proba(X)[0]
+        # classes assumed: [away, draw, home]
+        return {
+            "away": round(float(proba[0]), 4),
+            "draw": round(float(proba[1]), 4),
+            "home": round(float(proba[2]), 4),
+        }
