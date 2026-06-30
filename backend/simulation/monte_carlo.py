@@ -1,87 +1,94 @@
 import numpy as np
 from typing import Dict
-from backend.ml.goals import GoalsModel
 
 
 class MonteCarloSimulator:
     """
     Vectorised Monte Carlo match simulator.
-    Samples Poisson goals for each team across N simulations and
-    derives market-relevant probabilities from the distribution.
+    Samples goals, corners, cards, and BTTS for n simulations in one pass.
     """
 
-    def __init__(self, goals_model: GoalsModel):
-        self.goals_model = goals_model
-
-    def run(self, features: Dict, n: int = 100_000, seed: int = 42) -> Dict:
+    def simulate(
+        self,
+        home_xg: float,
+        away_xg: float,
+        home_xc: float = 5.2,  # expected corners
+        away_xc: float = 4.8,
+        home_xy: float = 1.8,  # expected yellow cards
+        away_xy: float = 1.8,
+        n: int = 100_000,
+        seed: int = None,
+    ) -> Dict:
         rng = np.random.default_rng(seed)
-        mu_home, mu_away = self.goals_model.expected_goals(features)
 
-        home_goals = rng.poisson(mu_home, size=n)
-        away_goals = rng.poisson(mu_away, size=n)
+        home_goals = rng.poisson(home_xg, n)
+        away_goals = rng.poisson(away_xg, n)
         total_goals = home_goals + away_goals
+        home_corners = rng.poisson(home_xc, n)
+        away_corners = rng.poisson(away_xc, n)
+        total_corners = home_corners + away_corners
+        home_cards = rng.poisson(home_xy, n)
+        away_cards = rng.poisson(away_xy, n)
+        total_cards = home_cards + away_cards
 
         outcome = np.sign(home_goals - away_goals)  # 1=home, 0=draw, -1=away
 
-        home_win   = float(np.mean(outcome == 1))
-        draw       = float(np.mean(outcome == 0))
-        away_win   = float(np.mean(outcome == -1))
-        over_0_5   = float(np.mean(total_goals > 0.5))
-        over_1_5   = float(np.mean(total_goals > 1.5))
-        over_2_5   = float(np.mean(total_goals > 2.5))
-        over_3_5   = float(np.mean(total_goals > 3.5))
-        over_4_5   = float(np.mean(total_goals > 4.5))
-        btts       = float(np.mean((home_goals > 0) & (away_goals > 0)))
-        btts_no    = 1.0 - btts
-        clean_home = float(np.mean(away_goals == 0))
-        clean_away = float(np.mean(home_goals == 0))
-
-        # Correct score probabilities (top 12 by frequency)
-        pairs = list(zip(home_goals.tolist(), away_goals.tolist()))
-        from collections import Counter
-        score_counts = Counter(pairs)
-        top_scores = [
-            {"score": f"{h}-{a}", "prob": round(cnt / n, 4)}
-            for (h, a), cnt in score_counts.most_common(12)
-        ]
-
-        # Asian Handicap -0.5 / +0.5
-        ah_home_minus_half = float(np.mean(home_goals > away_goals))  # home -0.5 wins
-        ah_away_plus_half  = 1.0 - ah_home_minus_half
-
-        # First half: approximate as ~45% of full time goal rate
-        mu_h_ht = mu_home * 0.45
-        mu_a_ht = mu_away * 0.45
-        ht_home = rng.poisson(mu_h_ht, size=n)
-        ht_away = rng.poisson(mu_a_ht, size=n)
-        ht_over_0_5 = float(np.mean(ht_home + ht_away > 0.5))
-        ht_over_1_5 = float(np.mean(ht_home + ht_away > 1.5))
-        ht_home_win = float(np.mean(ht_home > ht_away))
-        ht_draw     = float(np.mean(ht_home == ht_away))
-        ht_away_win = float(np.mean(ht_home < ht_away))
-
-        return {
+        result = {
+            "home_win": float(np.mean(outcome == 1)),
+            "draw": float(np.mean(outcome == 0)),
+            "away_win": float(np.mean(outcome == -1)),
+            "over_0_5": float(np.mean(total_goals > 0.5)),
+            "over_1_5": float(np.mean(total_goals > 1.5)),
+            "over_2_5": float(np.mean(total_goals > 2.5)),
+            "over_3_5": float(np.mean(total_goals > 3.5)),
+            "over_4_5": float(np.mean(total_goals > 4.5)),
+            "btts": float(np.mean((home_goals > 0) & (away_goals > 0))),
+            "btts_no": float(np.mean(~((home_goals > 0) & (away_goals > 0)))),
+            "over_8_5_corners": float(np.mean(total_corners > 8.5)),
+            "over_9_5_corners": float(np.mean(total_corners > 9.5)),
+            "over_10_5_corners": float(np.mean(total_corners > 10.5)),
+            "over_3_5_cards": float(np.mean(total_cards > 3.5)),
+            "home_clean_sheet": float(np.mean(away_goals == 0)),
+            "away_clean_sheet": float(np.mean(home_goals == 0)),
             "n": n,
-            "home_win":  round(home_win, 4),
-            "draw":      round(draw, 4),
-            "away_win":  round(away_win, 4),
-            "over_0_5":  round(over_0_5, 4),
-            "over_1_5":  round(over_1_5, 4),
-            "over_2_5":  round(over_2_5, 4),
-            "over_3_5":  round(over_3_5, 4),
-            "over_4_5":  round(over_4_5, 4),
-            "btts":      round(btts, 4),
-            "btts_no":   round(btts_no, 4),
-            "clean_sheet_home": round(clean_home, 4),
-            "clean_sheet_away": round(clean_away, 4),
-            "ah_home_minus_half": round(ah_home_minus_half, 4),
-            "ah_away_plus_half":  round(ah_away_plus_half, 4),
-            "ht_home_win": round(ht_home_win, 4),
-            "ht_draw":     round(ht_draw, 4),
-            "ht_away_win": round(ht_away_win, 4),
-            "ht_over_0_5": round(ht_over_0_5, 4),
-            "ht_over_1_5": round(ht_over_1_5, 4),
-            "home_goals_mean": round(float(np.mean(home_goals)), 3),
-            "away_goals_mean": round(float(np.mean(away_goals)), 3),
-            "top_correct_scores": top_scores,
+        }
+
+        # correct score top-10
+        pairs = list(zip(home_goals.tolist(), away_goals.tolist()))
+        score_counts: Dict[str, int] = {}
+        for h, a in pairs:
+            key = f"{h}-{a}"
+            score_counts[key] = score_counts.get(key, 0) + 1
+        result["correct_scores"] = dict(
+            sorted(score_counts.items(), key=lambda x: -x[1])[:15]
+        )
+        result["correct_score_probs"] = {
+            k: v / n for k, v in result["correct_scores"].items()
+        }
+
+        return result
+
+    def simulate_player(
+        self,
+        expected_shots: float = 2.5,
+        expected_goals: float = 0.35,
+        expected_assists: float = 0.15,
+        expected_cards: float = 0.12,
+        n: int = 100_000,
+        seed: int = None,
+    ) -> Dict:
+        """Simulate player-level markets."""
+        rng = np.random.default_rng(seed)
+        shots = rng.poisson(expected_shots, n)
+        goals = rng.poisson(expected_goals, n)
+        assists = rng.poisson(expected_assists, n)
+        cards = rng.binomial(1, expected_cards, n)
+        return {
+            "anytime_scorer": float(np.mean(goals >= 1)),
+            "shots_over_1_5": float(np.mean(shots > 1.5)),
+            "shots_over_2_5": float(np.mean(shots > 2.5)),
+            "shots_over_3_5": float(np.mean(shots > 3.5)),
+            "assists_over_0_5": float(np.mean(assists >= 1)),
+            "to_be_carded": float(np.mean(cards == 1)),
+            "n": n,
         }
