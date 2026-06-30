@@ -1,41 +1,44 @@
-from fastapi import APIRouter, Depends, HTTPException, Body
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
 from backend.db.base import get_db
-from backend.db.models import Match, Prediction
-from backend.schemas.bet import BetRequest, BetSuggestionResponse
+from backend.db import models
 from backend.features.store import FeatureStore
-from backend.ml.win_prob import WinProbModel
-from backend.ml.goals import GoalsModel
+from backend.ml.model_loader import ModelLoader
 from backend.simulation.monte_carlo import MonteCarloSimulator
-from backend.betting.engine import BetEngine
-from sqlalchemy import select, desc
+from backend.betting.engine import BettingEngine
+from backend.schemas.bet import BetRequest, BetSuggestionResponse
+from typing import List
 
 router = APIRouter()
-feature_store = FeatureStore()
-win_model = WinProbModel()
-goals_model = GoalsModel()
-simulator = MonteCarloSimulator(goals_model)
-bet_engine = BetEngine()
+fs = FeatureStore()
+loader = ModelLoader()
+mc = MonteCarloSimulator()
+engine = BettingEngine()
 
 
-@router.post("/{match_id}/suggest", response_model=BetSuggestionResponse)
-async def suggest_bets(
+@router.post("/{match_id}/suggest", response_model=List[BetSuggestionResponse])
+def suggest_bets(
     match_id: str,
     payload: BetRequest,
-    db: AsyncSession = Depends(get_db),
+    db: Session = Depends(get_db),
 ):
-    match = await db.get(Match, match_id)
+    match = db.query(models.Match).filter(models.Match.id == match_id).first()
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
+
     try:
-        features = feature_store.get(match_id)
+        features = fs.get(match_id)
     except KeyError:
-        raise HTTPException(status_code=422, detail="Features not ingested")
+        raise HTTPException(status_code=422, detail="Features not materialized")
 
-    win_probs = win_model.predict(features)
-    sim_result = simulator.run(features, n=200_000)
+    win_model = loader.get_win_model()
+    goals_model = loader.get_goals_model()
+    win_probs = win_model.predict_proba(features)
+    home_xg, away_xg = goals_model.expected_goals(features)
 
-    suggestions = bet_engine.build(
+    sim_result = mc.simulate(home_xg=home_xg, away_xg=away_xg, n=200_000)
+
+    suggestions = engine.build_suggestions(
         match_id=match_id,
         win_probs=win_probs,
         sim_result=sim_result,
@@ -44,4 +47,4 @@ async def suggest_bets(
         min_ev=payload.min_ev,
         kelly_fraction=payload.kelly_fraction,
     )
-    return {"match_id": match_id, "suggestions": suggestions}
+    return suggestions

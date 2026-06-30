@@ -1,72 +1,71 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
 from backend.db.base import get_db
-from backend.db.models import Match, Team
+from backend.db import models
 from backend.schemas.match import MatchCreate, MatchResponse, MatchListResponse
-from backend.features.engineering import FeatureEngineer
+from backend.features.engineering import compute_match_features
 from backend.features.store import FeatureStore
-from typing import List, Optional
+from typing import List
 import uuid
 
 router = APIRouter()
-feature_engineer = FeatureEngineer()
-feature_store = FeatureStore()
+fs = FeatureStore()
 
 
-@router.post("/", response_model=MatchResponse, status_code=201)
-async def create_match(payload: MatchCreate, db: AsyncSession = Depends(get_db)):
-    home = await db.get(Team, payload.home_team_id)
-    away = await db.get(Team, payload.away_team_id)
-    if not home or not away:
-        raise HTTPException(status_code=404, detail="Team not found")
-    match = Match(
+@router.post("/", response_model=MatchResponse)
+def create_match(payload: MatchCreate, db: Session = Depends(get_db)):
+    match = models.Match(
         id=str(uuid.uuid4()),
-        home_team_id=payload.home_team_id,
-        away_team_id=payload.away_team_id,
-        kickoff_ts=payload.kickoff_ts,
+        home_team=payload.home_team,
+        away_team=payload.away_team,
         league=payload.league,
+        kickoff_ts=payload.kickoff_ts,
         season=payload.season,
-        venue=payload.venue,
         status="scheduled",
     )
     db.add(match)
-    await db.commit()
-    await db.refresh(match)
+    db.commit()
+    db.refresh(match)
+
+    features = compute_match_features(
+        home_team=payload.home_team,
+        away_team=payload.away_team,
+        context=payload.context or {},
+    )
+    fs.materialize(match.id, features)
     return match
 
 
-@router.get("/", response_model=MatchListResponse)
-async def list_matches(
-    league: Optional[str] = None,
-    status: Optional[str] = None,
-    limit: int = Query(20, le=100),
-    offset: int = 0,
-    db: AsyncSession = Depends(get_db),
+@router.get("/", response_model=List[MatchListResponse])
+def list_matches(
+    league: str = None,
+    status: str = None,
+    limit: int = 50,
+    db: Session = Depends(get_db),
 ):
-    stmt = select(Match).order_by(desc(Match.kickoff_ts)).offset(offset).limit(limit)
+    q = db.query(models.Match)
     if league:
-        stmt = stmt.where(Match.league == league)
+        q = q.filter(models.Match.league == league)
     if status:
-        stmt = stmt.where(Match.status == status)
-    result = await db.execute(stmt)
-    matches = result.scalars().all()
-    return {"matches": matches, "total": len(matches)}
+        q = q.filter(models.Match.status == status)
+    return q.order_by(models.Match.kickoff_ts.desc()).limit(limit).all()
 
 
 @router.get("/{match_id}", response_model=MatchResponse)
-async def get_match(match_id: str, db: AsyncSession = Depends(get_db)):
-    match = await db.get(Match, match_id)
+def get_match(match_id: str, db: Session = Depends(get_db)):
+    match = db.query(models.Match).filter(models.Match.id == match_id).first()
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
     return match
 
 
-@router.post("/{match_id}/ingest-features")
-async def ingest_features(match_id: str, db: AsyncSession = Depends(get_db)):
-    match = await db.get(Match, match_id)
+@router.patch("/{match_id}/result")
+def update_result(match_id: str, home_goals: int, away_goals: int, db: Session = Depends(get_db)):
+    match = db.query(models.Match).filter(models.Match.id == match_id).first()
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
-    features = await feature_engineer.compute(match)
-    feature_store.set(match_id, features)
-    return {"status": "ok", "features": features}
+    match.home_goals = home_goals
+    match.away_goals = away_goals
+    match.status = "finished"
+    db.commit()
+    return {"status": "updated"}
